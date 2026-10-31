@@ -36,6 +36,29 @@ Result<MemoryBlock> allocate_memory(Device &device, const VkMemoryRequirements &
                                     MemoryUse use);
 Status free_memory(Device &device, MemoryBlock &block) noexcept;
 
+// Derived description of one VkPhysicalDeviceMemoryProperties entry. The probe prints
+// it in --verbose so a reader can see which heap a buffer landed in.
+struct MemoryTypeInfo {
+    VkMemoryPropertyFlags flags = 0;
+    VkMemoryHeapFlags heap_flags = 0;
+    uint32_t heap_index = 0;
+    VkDeviceSize heap_size = 0;
+    bool host_visible = false;
+    bool device_local = false;
+    bool host_coherent = false;
+    bool host_cached = false;
+};
+
+// Fills `info` for a memory type index. Fails with Error::NotFound when the index is
+// outside the device's memory type count.
+Status memory_type_info(const Device &device, uint32_t type_index, MemoryTypeInfo &info);
+
+// True when memory of this type can be mapped by the host.
+bool memory_type_is_host_visible(const Device &device, uint32_t type_index);
+
+// True when memory of this type is on a device-local heap.
+bool memory_type_is_device_local(const Device &device, uint32_t type_index);
+
 // Creates a buffer with TRANSFER_SRC | TRANSFER_DST forced on, because every
 // buffer must be reachable by the staging copy path.
 Result<BufferObject> allocate_buffer(Device &device, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -74,6 +97,10 @@ class StagingArena
     {
         return coherent_;
     }
+    uint32_t memory_type_index() const
+    {
+        return memory_type_index_;
+    }
 
     Status flush_all();
     Status invalidate_all();
@@ -87,6 +114,7 @@ class StagingArena
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkDeviceSize capacity_ = 0;
     void *mapped_ = nullptr;
+    uint32_t memory_type_index_ = 0;
     bool coherent_ = true;
 };
 

@@ -88,14 +88,26 @@ Result<bool> Fence::signaled() const
     return err_result<bool>(vk_status(result, "vkGetFenceStatus"));
 }
 
+VkFence Fence::release() noexcept
+{
+    const VkFence fence = fence_;
+    destroy_handle_only();
+    return fence;
+}
+
+void Fence::destroy_handle_only() noexcept
+{
+    device_ = VK_NULL_HANDLE;
+    fence_ = VK_NULL_HANDLE;
+    sequence_ = 0;
+}
+
 void Fence::destroy() noexcept
 {
     if (fence_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
         vkDestroyFence(device_, fence_, nullptr);
     }
-    device_ = VK_NULL_HANDLE;
-    fence_ = VK_NULL_HANDLE;
-    sequence_ = 0;
+    destroy_handle_only();
 }
 
 } // namespace vkbridge

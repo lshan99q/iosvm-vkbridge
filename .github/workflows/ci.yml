@@ -10,7 +10,8 @@ jobs:
     name: build, unit tests and GPU probe on lavapipe
     runs-on: ubuntu-24.04
     env:
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+      # The loader's current variable; VK_ICD_FILENAMES is the deprecated alias.
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -19,6 +20,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libvulkan-dev mesa-vulkan-drivers clang-format
+
+      # A missing ICD manifest must fail, never silently skip the GPU probe. The
+      # probe also exits non-zero when VK_DRIVER_FILES names a missing file.
+      - name: Require the lavapipe ICD
+        run: test -f "$VK_DRIVER_FILES"
 
       - name: Build
         run: make
@@ -41,6 +47,11 @@ jobs:
             echo "probe reported a failure" >&2
             exit 1
           fi
+          # The device-side oracle must have accepted the blit checks and the frame.
+          if [ "$(grep -c 'device checksum ok' /tmp/vkbridge-probe.txt)" -ne 3 ]; then
+            echo "expected three device-checksum lines (copy, fill, screenshot)" >&2
+            exit 1
+          fi
           test -s /tmp/vkbridge-ci.png
           file /tmp/vkbridge-ci.png | grep -q 'PNG image data, 320 x 200'
 
@@ -49,3 +60,12 @@ jobs:
 
       - name: ASan and UBSan unit tests
         run: make test-asan
+
+      # A wrong ICD path must be an error, not a skipped pass. Run the probe with a
+      # deliberately broken environment and require a non-zero exit.
+      - name: A missing ICD fails instead of skipping
+        run: |
+          if VK_DRIVER_FILES=/nonexistent ./build/vkbridge-probe --device-check; then
+            echo "the probe accepted a nonexistent VK_DRIVER_FILES" >&2
+            exit 1
+          fi

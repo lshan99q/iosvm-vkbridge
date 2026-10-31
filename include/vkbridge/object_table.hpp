@@ -29,6 +29,12 @@ struct ObjectRecord {
     VkDeviceSize size = 0;
     // VkBufferUsageFlags for buffers, VkImageUsageFlags for images.
     uint32_t usage = 0;
+    // Memory type the allocation came from, plus the two properties the probe asserts
+    // on: a blit source/destination must be device-local, and on devices that expose a
+    // non-mappable device-local type it must not be host-visible at all.
+    uint32_t memory_type_index = 0;
+    bool host_visible = false;
+    bool device_local = false;
 };
 
 class ObjectTable

@@ -2,6 +2,7 @@
 
 #include "vkbridge/replay.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -16,6 +17,7 @@ namespace
 {
 
 constexpr VkDeviceSize kCopyAlignment = 4;
+constexpr uint32_t kTimestampQueries = 2;
 
 bool aligned(VkDeviceSize value)
 {
@@ -42,6 +44,7 @@ Replay::~Replay()
     }
     VkDevice handle = device_->handle();
     vkDeviceWaitIdle(handle);
+    oracle_.reset();
     for (ReplayFenceRecord &record : fences_) {
         if (record.commands != VK_NULL_HANDLE) {
             vkFreeCommandBuffers(handle, pool_, 1, &record.commands);
@@ -62,6 +65,10 @@ Replay::~Replay()
             vkFreeMemory(handle, record.memory, nullptr);
         }
     }
+    if (timestamps_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(handle, timestamps_, nullptr);
+    }
+    timestamps_ = VK_NULL_HANDLE;
     if (pool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(handle, pool_, nullptr);
     }
@@ -86,6 +93,23 @@ Result<std::unique_ptr<Replay>> Replay::create(Device &device, ReplayOptions opt
     }
     std::unique_ptr<Replay> replay(new Replay(device, std::move(options)));
     replay->pool_ = pool;
+
+    if (device.info().timestamp_valid_bits != 0) {
+        VkQueryPoolCreateInfo query_info{};
+        query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_info.queryCount = kTimestampQueries;
+        VkQueryPool timestamps = VK_NULL_HANDLE;
+        const Status query_status =
+            vk_status(vkCreateQueryPool(device.handle(), &query_info, nullptr, &timestamps),
+                      "vkCreateQueryPool");
+        if (!query_status) {
+            vkDestroyCommandPool(device.handle(), pool, nullptr);
+            return err_result<std::unique_ptr<Replay>>(query_status);
+        }
+        replay->timestamps_ = timestamps;
+    }
+
     return ok_result<std::unique_ptr<Replay>>(std::move(replay));
 }
 
@@ -117,6 +141,11 @@ Status Replay::ensure_recording()
         return status;
     }
 
+    timestamps_recorded_ = 0;
+    if (timestamps_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commands, timestamps_, 0, kTimestampQueries);
+    }
+
     recording_ = commands;
     recording_active_ = true;
     return status_ok();
@@ -146,7 +175,6 @@ Status Replay::finish_submit(uint64_t *sequence_out)
         return status;
     }
 
-    const uint64_t sequence = sequence_.next();
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
@@ -158,7 +186,10 @@ Status Replay::finish_submit(uint64_t *sequence_out)
         return vk_status(result, "vkQueueSubmit");
     }
 
-    fences_.push_back(ReplayFenceRecord{sequence, fence, commands, false});
+    // The sequence is allocated only after the submission succeeded, so the numbers are
+    // dense: every value in 1..last_sequence_ names a batch that reached the queue.
+    const uint64_t sequence = sequence_.next();
+    fences_.push_back(ReplayFenceRecord{sequence, fence, commands});
     last_sequence_ = sequence;
     ++submitted_;
     *sequence_out = sequence;
@@ -183,15 +214,12 @@ Status Replay::wait_fence(uint64_t sequence, uint64_t timeout_ns)
     if (sequence == 0) {
         return status_fail(Error::InvalidArgument, "sequence 0 is reserved");
     }
-    for (ReplayFenceRecord &record : fences_) {
-        if (record.sequence != sequence) {
+    for (auto record = fences_.begin(); record != fences_.end(); ++record) {
+        if (record->sequence != sequence) {
             continue;
         }
-        if (record.waited) {
-            return status_ok();
-        }
         const VkResult result =
-            vkWaitForFences(device_->handle(), 1, &record.fence, VK_TRUE, timeout_ns);
+            vkWaitForFences(device_->handle(), 1, &record->fence, VK_TRUE, timeout_ns);
         if (result == VK_TIMEOUT) {
             return status_fail(Error::Timeout,
                                describe_sequence(sequence) + " was not signaled in time");
@@ -200,11 +228,18 @@ Status Replay::wait_fence(uint64_t sequence, uint64_t timeout_ns)
         if (!status) {
             return status;
         }
-        record.waited = true;
-        if (record.commands != VK_NULL_HANDLE) {
-            vkFreeCommandBuffers(device_->handle(), pool_, 1, &record.commands);
-            record.commands = VK_NULL_HANDLE;
+        // Signaled: neither the fence nor the command buffer is in use anymore. Reap
+        // both so fences do not accumulate for the lifetime of the replay.
+        if (record->commands != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_->handle(), pool_, 1, &record->commands);
         }
+        vkDestroyFence(device_->handle(), record->fence, nullptr);
+        fences_.erase(record);
+        return status_ok();
+    }
+    if (sequence <= last_sequence_) {
+        // Every submitted sequence is either still in fences_ or was reaped after its
+        // fence signaled, so a repeated wait on a reaped sequence is a success.
         return status_ok();
     }
     return status_fail(Error::NotFound, "unknown " + describe_sequence(sequence));
@@ -216,9 +251,6 @@ Result<bool> Replay::fence_signaled(uint64_t sequence)
         if (record.sequence != sequence) {
             continue;
         }
-        if (record.waited) {
-            return ok_result<bool>(true);
-        }
         const VkResult result = vkGetFenceStatus(device_->handle(), record.fence);
         if (result == VK_SUCCESS) {
             return ok_result<bool>(true);
@@ -228,21 +260,71 @@ Result<bool> Replay::fence_signaled(uint64_t sequence)
         }
         return err_result<bool>(vk_status(result, "vkGetFenceStatus"));
     }
+    if (sequence <= last_sequence_) {
+        return ok_result<bool>(true);
+    }
     return err_result<bool>(Error::NotFound, "unknown " + describe_sequence(sequence));
 }
 
 Status Replay::wait_all()
 {
-    for (ReplayFenceRecord &record : fences_) {
-        if (record.waited) {
-            continue;
-        }
-        const Status status = wait_fence(record.sequence, options_.fence_timeout_ns);
+    while (!fences_.empty()) {
+        const Status status = wait_fence(fences_.front().sequence, options_.fence_timeout_ns);
         if (!status) {
             return status;
         }
     }
     return status_ok();
+}
+
+Result<VkCommandBuffer> Replay::command_buffer_of(uint64_t sequence) const
+{
+    for (const ReplayFenceRecord &record : fences_) {
+        if (record.sequence == sequence) {
+            return ok_result<VkCommandBuffer>(record.commands);
+        }
+    }
+    return err_result<VkCommandBuffer>(Error::NotFound,
+                                       describe_sequence(sequence) + " is not outstanding");
+}
+
+Result<uint32_t> Replay::record_timestamp()
+{
+    if (timestamps_ == VK_NULL_HANDLE) {
+        return err_result<uint32_t>(Error::Unsupported,
+                                    "this device or queue family has no timestamps");
+    }
+    const Status status = ensure_recording();
+    if (!status) {
+        return err_result<uint32_t>(status);
+    }
+    if (timestamps_recorded_ >= kTimestampQueries) {
+        return err_result<uint32_t>(Error::CapacityExceeded,
+                                    "at most two timestamps fit in one submission");
+    }
+    const uint32_t token = timestamps_recorded_++;
+    vkCmdWriteTimestamp(recording_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, token);
+    return ok_result<uint32_t>(token);
+}
+
+Result<uint64_t> Replay::timestamp_ns(uint32_t token) const
+{
+    if (timestamps_ == VK_NULL_HANDLE || token >= timestamps_recorded_) {
+        return err_result<uint64_t>(Error::NotFound, "timestamp token was not recorded");
+    }
+    uint64_t ticks = 0;
+    const VkResult result =
+        vkGetQueryPoolResults(device_->handle(), timestamps_, token, 1, sizeof(ticks), &ticks,
+                              sizeof(ticks), VK_QUERY_RESULT_64_BIT);
+    if (result == VK_NOT_READY) {
+        return err_result<uint64_t>(Error::Internal,
+                                    "the timestamp query is not ready; wait for the submission");
+    }
+    if (result != VK_SUCCESS) {
+        return err_result<uint64_t>(vk_status(result, "vkGetQueryPoolResults"));
+    }
+    const double nanoseconds = static_cast<double>(ticks) * device_->info().timestamp_period_ns;
+    return ok_result<uint64_t>(static_cast<uint64_t>(std::llround(nanoseconds)));
 }
 
 Status Replay::flush()
@@ -320,6 +402,9 @@ Result<uint32_t> Replay::create_buffer(VkDeviceSize size, VkBufferUsageFlags usa
     record.memory = buffer->memory.memory;
     record.size = buffer->size;
     record.usage = static_cast<uint32_t>(buffer->usage);
+    record.memory_type_index = buffer->memory.type_index;
+    record.host_visible = memory_type_is_host_visible(*device_, buffer->memory.type_index);
+    record.device_local = memory_type_is_device_local(*device_, buffer->memory.type_index);
 
     Result<uint32_t> handle = objects_.add(record);
     if (!handle) {
@@ -412,7 +497,7 @@ Result<std::vector<uint8_t>> Replay::readback(uint32_t handle, VkDeviceSize size
 }
 
 Status Replay::blit_copy(uint32_t src, uint32_t dst, VkDeviceSize size, VkDeviceSize src_offset,
-                         VkDeviceSize dst_offset)
+                         VkDeviceSize dst_offset, uint32_t attestation, uint32_t nonce)
 {
     if (size == 0) {
         return status_fail(Error::InvalidArgument, "copy size must be non-zero");
@@ -445,10 +530,24 @@ Status Replay::blit_copy(uint32_t src, uint32_t dst, VkDeviceSize size, VkDevice
     region.dstOffset = dst_offset;
     region.size = size;
     vkCmdCopyBuffer(recording_, source->buffer, destination->buffer, 1, &region);
-    return status_ok();
+
+    if (attestation == ObjectTable::kInvalidHandle) {
+        return status_ok();
+    }
+    if ((destination->usage & static_cast<uint32_t>(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) == 0) {
+        return status_fail(Error::InvalidArgument,
+                           "an attested copy needs VK_BUFFER_USAGE_STORAGE_BUFFER_BIT on the "
+                           "destination");
+    }
+    if (size / 4 > static_cast<VkDeviceSize>(std::numeric_limits<uint32_t>::max())) {
+        return status_fail(Error::SizeTooLarge, "the attested range does not fit in 32-bit words");
+    }
+    return record_attestation(destination->buffer, static_cast<uint32_t>(dst_offset / 4),
+                              static_cast<uint32_t>(size / 4), attestation, nonce);
 }
 
-Status Replay::blit_fill(uint32_t handle, VkDeviceSize offset, VkDeviceSize size, uint32_t value32)
+Status Replay::blit_fill(uint32_t handle, VkDeviceSize offset, VkDeviceSize size, uint32_t value32,
+                         uint32_t attestation, uint32_t nonce)
 {
     if (size == 0) {
         return status_fail(Error::InvalidArgument, "fill size must be non-zero");
@@ -470,6 +569,83 @@ Status Replay::blit_fill(uint32_t handle, VkDeviceSize offset, VkDeviceSize size
         return status;
     }
     vkCmdFillBuffer(recording_, record->buffer, offset, size, value32);
+
+    if (attestation == ObjectTable::kInvalidHandle) {
+        return status_ok();
+    }
+    if ((record->usage & static_cast<uint32_t>(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) == 0) {
+        return status_fail(Error::InvalidArgument,
+                           "an attested fill needs VK_BUFFER_USAGE_STORAGE_BUFFER_BIT on the "
+                           "buffer");
+    }
+    if (size / 4 > static_cast<VkDeviceSize>(std::numeric_limits<uint32_t>::max())) {
+        return status_fail(Error::SizeTooLarge, "the attested range does not fit in 32-bit words");
+    }
+    return record_attestation(record->buffer, static_cast<uint32_t>(offset / 4),
+                              static_cast<uint32_t>(size / 4), attestation, nonce);
+}
+
+Result<Oracle *> Replay::ensure_oracle()
+{
+    if (!oracle_) {
+        Result<Oracle> created = Oracle::create(*device_);
+        if (!created) {
+            return err_result<Oracle *>(created.status());
+        }
+        oracle_ = std::make_unique<Oracle>(std::move(created.value()));
+    }
+    return ok_result<Oracle *>(oracle_.get());
+}
+
+Status Replay::record_attestation(VkBuffer source, uint32_t first_word, uint32_t word_count,
+                                  uint32_t attestation, uint32_t nonce)
+{
+    const ObjectRecord *attestation_record = nullptr;
+    Status status = require_buffer(
+        attestation, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, 8,
+        &attestation_record);
+    if (!status) {
+        return status;
+    }
+    const Result<Oracle *> oracle = ensure_oracle();
+    if (!oracle) {
+        return oracle.status();
+    }
+
+    // The copy/fill wrote the range in this submission; make it visible to the shader.
+    VkBufferMemoryBarrier to_compute{};
+    to_compute.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_compute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_compute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_compute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.buffer = source;
+    to_compute.offset = 0;
+    to_compute.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(recording_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &to_compute, 0,
+                         nullptr);
+
+    status = (*oracle)->record(recording_, source, first_word, word_count, nonce, false,
+                               attestation_record->buffer);
+    if (!status) {
+        return status;
+    }
+
+    // The result is read back through the staging path in a later submission; make the
+    // shader write available to the transfer stage.
+    VkBufferMemoryBarrier to_transfer{};
+    to_transfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.buffer = attestation_record->buffer;
+    to_transfer.offset = 0;
+    to_transfer.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(recording_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &to_transfer, 0,
+                         nullptr);
     return status_ok();
 }
 
@@ -502,7 +678,23 @@ Result<ScreenshotInfo> Replay::screenshot(const std::string &path, const Screens
     info.height = rendered->height;
     info.unique_colours = rendered->unique_colours;
     info.rgba = std::move(rendered->rgba);
+    info.attestation = rendered->attestation;
+    info.attestation_nonce = options.attestation_nonce;
+    info.render_target_device_local = rendered->render_target_device_local;
+    info.render_target_host_visible = rendered->render_target_host_visible;
     return ok_result<ScreenshotInfo>(std::move(info));
+}
+
+bool Replay::object_is_host_visible(uint32_t handle) const
+{
+    const ObjectRecord *record = objects_.find(handle);
+    return record != nullptr && record->host_visible;
+}
+
+bool Replay::object_is_device_local(uint32_t handle) const
+{
+    const ObjectRecord *record = objects_.find(handle);
+    return record != nullptr && record->device_local;
 }
 
 Status Replay::destroy_object(uint32_t handle)
@@ -547,10 +739,12 @@ Status Replay::apply(const Command &command)
     case CommandType::BlitCopy:
         return blit_copy(command.src, command.dst, static_cast<VkDeviceSize>(command.size),
                          static_cast<VkDeviceSize>(command.offset),
-                         static_cast<VkDeviceSize>(command.dst_offset));
+                         static_cast<VkDeviceSize>(command.dst_offset), command.attestation,
+                         command.nonce);
     case CommandType::BlitFill:
         return blit_fill(command.handle, static_cast<VkDeviceSize>(command.offset),
-                         static_cast<VkDeviceSize>(command.size), command.value32);
+                         static_cast<VkDeviceSize>(command.size), command.value32,
+                         command.attestation, command.nonce);
     case CommandType::Submit: {
         Result<uint64_t> sequence = submit();
         if (!sequence) {

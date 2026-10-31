@@ -43,8 +43,14 @@ class Fence
     // Never blocks. False means not signaled yet.
     Result<bool> signaled() const;
 
+    // Forgets the fence without destroying it. Used when a device is lost: the fence
+    // may still be referenced by an in-flight submission, and destroying it would be
+    // undefined behaviour, so it is leaked deliberately instead.
+    VkFence release() noexcept;
+
   private:
     void destroy() noexcept;
+    void destroy_handle_only() noexcept;
 
     VkDevice device_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;

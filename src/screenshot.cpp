@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <utility>
 
 #include "vkbridge/fence.hpp"
@@ -17,6 +18,7 @@ namespace
 
 constexpr uint64_t kScreenshotTimeoutNs = 5'000'000'000ull;
 constexpr uint32_t kMaxScreenshotDimension = 16384;
+constexpr VkDeviceSize kAttestationBytes = 8;
 
 VkClearColorValue clear_value_from_rgba(uint32_t rgba)
 {
@@ -45,6 +47,7 @@ struct RenderTarget {
     VkRenderPass render_pass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t memory_type_index = 0;
     bool bgra = false;
 
     RenderTarget() = default;
@@ -74,6 +77,19 @@ struct RenderTarget {
                 vkFreeMemory(device->handle(), memory, nullptr);
             }
         }
+        destroy_handles_only();
+    }
+
+    // Keeps the Vulkan handles but forgets them, so the destructor does not destroy
+    // objects that may still be in use after a device loss.
+    void release() noexcept
+    {
+        destroy_handles_only();
+    }
+
+  private:
+    void destroy_handles_only() noexcept
+    {
         device = nullptr;
         image = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
@@ -81,6 +97,7 @@ struct RenderTarget {
         render_pass = VK_NULL_HANDLE;
         framebuffer = VK_NULL_HANDLE;
         format = VK_FORMAT_UNDEFINED;
+        memory_type_index = 0;
         bgra = false;
     }
 };
@@ -98,6 +115,35 @@ struct CommandBufferLease {
         if (commands != VK_NULL_HANDLE && device != VK_NULL_HANDLE && pool != VK_NULL_HANDLE) {
             vkFreeCommandBuffers(device, pool, 1, &commands);
         }
+    }
+
+    void release() noexcept
+    {
+        device = VK_NULL_HANDLE;
+        pool = VK_NULL_HANDLE;
+        commands = VK_NULL_HANDLE;
+    }
+};
+
+// Owns a device-local buffer for the duration of the screenshot call.
+struct BufferLease {
+    Device *device = nullptr;
+    BufferObject object;
+
+    BufferLease() = default;
+    BufferLease(const BufferLease &) = delete;
+    BufferLease &operator=(const BufferLease &) = delete;
+    ~BufferLease()
+    {
+        if (device != nullptr) {
+            release_buffer(*device, object);
+        }
+    }
+
+    void release() noexcept
+    {
+        device = nullptr;
+        object = BufferObject{};
     }
 };
 
@@ -147,6 +193,7 @@ Status create_render_target(Device &device, const ScreenshotOptions &options, Re
         return status;
     }
     target.memory = memory->memory;
+    target.memory_type_index = memory->type_index;
 
     VkImageViewCreateInfo view_info{};
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -270,6 +317,66 @@ void record_frame(VkCommandBuffer commands, const RenderTarget &target,
                            readback_buffer, 1, &region);
 }
 
+// Records the copy of the rendered image into the device-local attestation input and
+// the compute dispatch that checksums it. `swizzle` converts B8G8R8A8 words so the
+// checksum matches the RGBA order the host receives.
+Status record_attestation(VkCommandBuffer commands, const RenderTarget &target,
+                          const ScreenshotLayout &layout, VkBuffer image_bytes,
+                          const Oracle &oracle, VkBuffer attestation, VkBuffer staging,
+                          VkDeviceSize attestation_offset, const ScreenshotOptions &options)
+{
+    const VkDeviceSize byte_count = static_cast<VkDeviceSize>(layout.width) * layout.height * 4u;
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {layout.width, layout.height, 1};
+    vkCmdCopyImageToBuffer(commands, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           image_bytes, 1, &region);
+
+    VkBufferMemoryBarrier to_compute{};
+    to_compute.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_compute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_compute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_compute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.buffer = image_bytes;
+    to_compute.offset = 0;
+    to_compute.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &to_compute, 0,
+                         nullptr);
+
+    Status status = oracle.record(commands, image_bytes, 0, static_cast<uint32_t>(byte_count / 4),
+                                  options.attestation_nonce, target.bgra, attestation);
+    if (!status) {
+        return status;
+    }
+
+    VkBufferMemoryBarrier to_transfer{};
+    to_transfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.buffer = attestation;
+    to_transfer.offset = 0;
+    to_transfer.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &to_transfer, 0,
+                         nullptr);
+
+    VkBufferCopy result_copy{};
+    result_copy.srcOffset = 0;
+    result_copy.dstOffset = attestation_offset;
+    result_copy.size = kAttestationBytes;
+    vkCmdCopyBuffer(commands, attestation, staging, 1, &result_copy);
+    return status_ok();
+}
+
 } // namespace
 
 Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_pool,
@@ -289,8 +396,9 @@ Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_
 
     const uint64_t pixel_count = static_cast<uint64_t>(options.width) * options.height;
     const VkDeviceSize byte_count = static_cast<VkDeviceSize>(pixel_count) * 4;
+    const VkDeviceSize staging_bytes = byte_count + kAttestationBytes;
 
-    const Result<void *> mapped = staging.ensure(byte_count);
+    const Result<void *> mapped = staging.ensure(staging_bytes);
     if (!mapped) {
         return err_result<ScreenshotImage>(mapped.status());
     }
@@ -300,6 +408,33 @@ Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_
     if (!status) {
         return err_result<ScreenshotImage>(status);
     }
+
+    BufferLease image_bytes;
+    image_bytes.device = &device;
+    Result<BufferObject> allocated_image = allocate_buffer(
+        device, byte_count, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        MemoryUse::DeviceLocal);
+    if (!allocated_image) {
+        return err_result<ScreenshotImage>(allocated_image.status());
+    }
+    image_bytes.object = allocated_image.value();
+
+    BufferLease attestation;
+    attestation.device = &device;
+    Result<BufferObject> allocated_attestation =
+        allocate_buffer(device, kAttestationBytes,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        MemoryUse::DeviceLocal);
+    if (!allocated_attestation) {
+        return err_result<ScreenshotImage>(allocated_attestation.status());
+    }
+    attestation.object = allocated_attestation.value();
+
+    Result<Oracle> created_oracle = Oracle::create(device);
+    if (!created_oracle) {
+        return err_result<ScreenshotImage>(created_oracle.status());
+    }
+    std::unique_ptr<Oracle> oracle(new Oracle(std::move(created_oracle.value())));
 
     VkCommandBufferAllocateInfo allocate_info{};
     allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -327,6 +462,11 @@ Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_
 
     const ScreenshotLayout layout = make_screenshot_layout(options.width, options.height);
     record_frame(commands, target, layout, staging.buffer());
+    status = record_attestation(commands, target, layout, image_bytes.object.buffer, *oracle,
+                                attestation.object.buffer, staging.buffer(), byte_count, options);
+    if (!status) {
+        return err_result<ScreenshotImage>(status);
+    }
 
     status = vk_status(vkEndCommandBuffer(commands), "vkEndCommandBuffer");
     if (!status) {
@@ -346,8 +486,28 @@ Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_
     if (!status) {
         return err_result<ScreenshotImage>(status);
     }
+
+    // From here on the submission is in flight: any error must drain the device before
+    // the RAII owners destroy the fence, command buffer, image, memory and pipeline.
     status = fence->wait(kScreenshotTimeoutNs);
     if (!status) {
+        const Status idle_status = vk_status(vkDeviceWaitIdle(device.handle()), "vkDeviceWaitIdle");
+        if (!idle_status) {
+            // The device did not drain (it is lost or reset). Destroying handles that may
+            // still be in use is undefined behaviour, so deliberately leak them; the
+            // caller reports the original failure and the process exits.
+            target.release();
+            lease.release();
+            image_bytes.release();
+            attestation.release();
+            fence->release();
+            oracle.release();
+            return err_result<ScreenshotImage>(
+                Status(status.code(), status.to_string() + "; vkDeviceWaitIdle also failed (" +
+                                          idle_status.to_string() +
+                                          "), so the in-flight fence, command buffer, image, "
+                                          "buffers and compute pipeline were deliberately leaked"));
+        }
         return err_result<ScreenshotImage>(status);
     }
 
@@ -376,6 +536,14 @@ Result<ScreenshotImage> render_screenshot(Device &device, VkCommandPool command_
 
     image.unique_colours =
         count_unique_colours(image.rgba.data(), static_cast<size_t>(pixel_count));
+    image.attestation.checksum = read_le32(source + byte_count);
+    image.attestation.fingerprint = read_le32(source + byte_count + 4);
+
+    MemoryTypeInfo type_info;
+    if (memory_type_info(device, target.memory_type_index, type_info)) {
+        image.render_target_device_local = type_info.device_local;
+        image.render_target_host_visible = type_info.host_visible;
+    }
     return ok_result<ScreenshotImage>(std::move(image));
 }
 

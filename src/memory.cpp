@@ -101,6 +101,46 @@ Result<MemoryBlock> allocate_memory(Device &device, const VkMemoryRequirements &
     return ok_result<MemoryBlock>(std::move(block));
 }
 
+Status memory_type_info(const Device &device, uint32_t type_index, MemoryTypeInfo &info)
+{
+    const VkPhysicalDeviceMemoryProperties &properties = device.memory_properties();
+    if (type_index >= properties.memoryTypeCount) {
+        return status_fail(Error::NotFound,
+                           "memory type " + std::to_string(type_index) + " does not exist");
+    }
+    const VkMemoryType &type = properties.memoryTypes[type_index];
+    info = MemoryTypeInfo{};
+    info.flags = type.propertyFlags;
+    info.heap_index = type.heapIndex;
+    if (type.heapIndex < VK_MAX_MEMORY_HEAPS) {
+        info.heap_flags = properties.memoryHeaps[type.heapIndex].flags;
+        info.heap_size = properties.memoryHeaps[type.heapIndex].size;
+    }
+    info.host_visible = (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+    info.device_local = (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u;
+    info.host_coherent = (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u;
+    info.host_cached = (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+    return status_ok();
+}
+
+bool memory_type_is_host_visible(const Device &device, uint32_t type_index)
+{
+    MemoryTypeInfo info;
+    if (!memory_type_info(device, type_index, info)) {
+        return false;
+    }
+    return info.host_visible;
+}
+
+bool memory_type_is_device_local(const Device &device, uint32_t type_index)
+{
+    MemoryTypeInfo info;
+    if (!memory_type_info(device, type_index, info)) {
+        return false;
+    }
+    return info.device_local;
+}
+
 Status free_memory(Device &device, MemoryBlock &block) noexcept
 {
     if (block.memory == VK_NULL_HANDLE) {
@@ -209,6 +249,7 @@ void StagingArena::take_from(StagingArena &other) noexcept
     memory_ = other.memory_;
     capacity_ = other.capacity_;
     mapped_ = other.mapped_;
+    memory_type_index_ = other.memory_type_index_;
     coherent_ = other.coherent_;
 
     other.device_ = nullptr;
@@ -216,6 +257,7 @@ void StagingArena::take_from(StagingArena &other) noexcept
     other.memory_ = VK_NULL_HANDLE;
     other.capacity_ = 0;
     other.mapped_ = nullptr;
+    other.memory_type_index_ = 0;
     other.coherent_ = true;
 }
 
@@ -247,6 +289,7 @@ Result<void *> StagingArena::ensure(VkDeviceSize bytes)
     memory_ = allocated->memory.memory;
     mapped_ = allocated->memory.mapped;
     capacity_ = allocated->size;
+    memory_type_index_ = allocated->memory.type_index;
     coherent_ =
         (device_->memory_properties().memoryTypes[allocated->memory.type_index].propertyFlags &
          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -304,6 +347,7 @@ void StagingArena::destroy() noexcept
     memory_ = VK_NULL_HANDLE;
     capacity_ = 0;
     mapped_ = nullptr;
+    memory_type_index_ = 0;
     coherent_ = true;
 }
 

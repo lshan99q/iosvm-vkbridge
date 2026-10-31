@@ -76,6 +76,11 @@ struct DeviceInfo {
     VkQueueFlags queue_flags = 0;
     VkDeviceSize max_buffer_bytes = 0;
     VkDeviceSize non_coherent_atom_size = 1;
+    // VkPhysicalDeviceLimits::timestampPeriod, in nanoseconds per tick.
+    float timestamp_period_ns = 1.0f;
+    // Timestamp bits of the selected queue family; zero means device timestamps are
+    // not available on this queue.
+    uint32_t timestamp_valid_bits = 0;
 };
 
 // Owns VkDevice plus one queue from a graphics-or-compute family. No optional

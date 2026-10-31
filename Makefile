@@ -31,7 +31,7 @@ TEST_ASAN_BINARY := $(BUILD)/vkbridge-tests-asan
 PROBE_ASAN := $(BUILD)/vkbridge-probe-asan
 SCREENSHOT := $(BUILD)/vkbridge-probe.png
 
-.PHONY: all probe test test-asan probe-asan clean help format-check
+.PHONY: all probe test test-asan probe-asan clean help format-check spirv
 
 all: $(LIB) $(PROBE)
 
@@ -66,15 +66,18 @@ $(TEST_ASAN_BINARY): $(TEST_SOURCES) $(LIB_SOURCES)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SANITIZE_FLAGS) $(VULKAN_CFLAGS) $(TEST_SOURCES) \
 		$(LIB_SOURCES) $(VULKAN_LIBS) -o $@
 
-# Unit tests need no GPU. The probe is the GPU integration test; when no physical
-# device can be opened the Vulkan half is skipped instead of failing.
+# Unit tests need no GPU. The probe is the GPU integration test: no device at all is a
+# loud skip (exit 0), but a Vulkan ICD named in the environment that is missing or fails
+# to load is an error. The probe distinguishes the two with its exit code.
 test: all $(TEST_BINARY)
 	./$(TEST_BINARY)
-	@if ./$(PROBE) --device-check >/dev/null 2>&1; then \
-		./$(PROBE) --screenshot $(SCREENSHOT); \
-	else \
-		echo "[skip] no Vulkan device"; \
-	fi
+	@./$(PROBE) --device-check; status=$$?; \
+	case $$status in \
+	0) ./$(PROBE) --screenshot $(SCREENSHOT);; \
+	3) echo "[skip] no Vulkan device (device check exit 3); the GPU checks did not run" ;; \
+	*) echo "[error] the Vulkan device check failed (exit $$status), so this is not a skip" >&2; \
+	   exit 1 ;; \
+	esac
 
 # ASan/UBSan is kept to the pure unit tests: Vulkan drivers commonly leak and
 # trip LeakSanitizer inside the ICD, which is not our memory.
@@ -91,6 +94,12 @@ format-check:
 	clang-format --dry-run --Werror $(LIB_SOURCES) $(wildcard include/vkbridge/*.hpp) \
 		tools/*.cpp tests/*.cpp tests/*.hpp
 
+# Regenerates include/vkbridge/oracle_spirv.hpp from shaders/oracle.comp. Only needed
+# when the shader changes; the generated words are committed so the build needs no
+# shader compiler. Requires glslang-tools (see README prerequisites).
+spirv:
+	./tools/embed-spirv.sh
+
 clean:
 	rm -rf $(BUILD)
 
@@ -101,9 +110,10 @@ help:
 	@echo "make test-asan  build and run the pure unit tests with ASan + UBSan"
 	@echo "make probe-asan run the GPU probe under ASan + UBSan (leak detection off)"
 	@echo "make format-check  verify clang-format cleanliness"
+	@echo "make spirv         regenerate the embedded oracle SPIR-V (needs glslang-tools)"
 	@echo "make clean      remove build/"
 	@echo "make help       this text"
 	@echo ""
-	@echo "Lavapipe: VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json make test"
+	@echo "Lavapipe: VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json make test"
 
 -include $(LIB_OBJECTS:.o=.d) $(PROBE_OBJECT:.o=.d)

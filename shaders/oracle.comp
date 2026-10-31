@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: MIT
+
+#version 450
+
+// Device-side attestation shader for vkbridge-probe.
+//
+// Reads `word_count` 32-bit words starting at `first_word` from a storage buffer,
+// XORs them (order-independent), optionally swaps the R and B bytes of every word
+// (for a B8G8R8A8 screenshot image), then writes
+//   word 0: checksum ^ nonce
+//   word 1: 0x4F524143 ("ORAC") ^ nonce
+// into a second storage buffer. The host recomputes the checksum and compares.
+//
+// Only a real dispatch on the device writes those two words: the host never writes
+// the expected result, and a host-side replacement of the blit/fill path never
+// records this shader, so the attestation buffer keeps its sentinel.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer SourceWords {
+    uint source_words[];
+} source;
+
+layout(binding = 1, std430) writeonly buffer AttestationWords {
+    uint attestation_words[];
+} attestation;
+
+layout(push_constant) uniform Parameters {
+    uint first_word;
+    uint word_count;
+    uint nonce;
+    uint swizzle;
+} parameters;
+
+const uint kMarker = 0x4F524143u; // "ORAC"
+
+shared uint partial[256];
+
+void main()
+{
+    const uint local = gl_LocalInvocationID.x;
+    uint accumulated = 0u;
+    for (uint index = local; index < parameters.word_count; index += 256u) {
+        uint word = source.source_words[parameters.first_word + index];
+        if (parameters.swizzle != 0u) {
+            // B8G8R8A8 (little-endian bytes b,g,r,a) -> R8G8B8A8 (r,g,b,a).
+            word = (word & 0xFF00FF00u) | ((word & 0x000000FFu) << 16) |
+                   ((word & 0x00FF0000u) >> 16);
+        }
+        accumulated ^= word;
+    }
+    partial[local] = accumulated;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (local < stride) {
+            partial[local] ^= partial[local + stride];
+        }
+        barrier();
+    }
+    if (local == 0u) {
+        attestation.attestation_words[0] = partial[0] ^ parameters.nonce;
+        attestation.attestation_words[1] = kMarker ^ parameters.nonce;
+    }
+}

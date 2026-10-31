@@ -78,6 +78,7 @@ struct QueueChoice {
     uint32_t family = 0;
     VkQueueFlags flags = 0;
     uint32_t count = 0;
+    uint32_t timestamp_valid_bits = 0;
     int score = -1;
 };
 
@@ -110,6 +111,7 @@ QueueChoice choose_queue_family(VkPhysicalDevice physical_device)
             best.family = index;
             best.flags = flags;
             best.count = families[index].queueCount;
+            best.timestamp_valid_bits = families[index].timestampValidBits;
             best.score = score;
         }
     }
@@ -436,6 +438,10 @@ Result<Device> Device::create(Instance &instance, const DeviceOptions &options)
     device.info_.queue_family = best.queue.family;
     device.info_.queue_count = best.queue.count;
     device.info_.queue_flags = best.queue.flags;
+    device.info_.timestamp_valid_bits = best.queue.timestamp_valid_bits;
+    device.info_.timestamp_period_ns = best.properties.limits.timestampPeriod > 0.0f
+                                           ? best.properties.limits.timestampPeriod
+                                           : 1.0f;
     device.info_.non_coherent_atom_size = std::max<VkDeviceSize>(
         1, static_cast<VkDeviceSize>(best.properties.limits.nonCoherentAtomSize));
 
