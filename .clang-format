@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Keep QEMU's hw/ style so that the device can follow upstream (see docs/adr/ADR-001-qemu-fork.md).
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+UseTab: Never
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+SortIncludes: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never

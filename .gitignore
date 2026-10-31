@@ -1,0 +1,50 @@
+# Apple content, images and firmware — never committed
+firmware/
+userland/
+userland-raw/
+*.ipsw
+*.dmg
+bootkc
+dtree
+*.apfs
+*.tc
+*.im4p
+*.im4m
+
+# Device firmware
+fw-*/
+
+# Build products
+build/
+out/
+*.o
+*.a
+*.dylib
+*.so
+*.efi
+payload.bin
+
+# The QEMU fork is a submodule; its work tree is not tracked here
+qemu/*
+!qemu/.git
+!qemu/README.md
+
+# Logs and ad-hoc screenshots. Acceptance captures live in docs/demo/ and are tracked.
+logs/
+*.log
+docs/demo/**/scratch*
+
+# Local configuration
+.env
+.env.*
+*.local.conf
+.vscode/
+.idea/
+.DS_Store
+
+# Scratch
+tools/scratch/
+*.swp
+*~
+__pycache__/
+*.pyc

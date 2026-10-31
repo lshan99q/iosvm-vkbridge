@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lavapipe:
+    name: build, unit tests and GPU probe on lavapipe
+    runs-on: ubuntu-24.04
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libvulkan-dev mesa-vulkan-drivers clang-format
+
+      - name: Build
+        run: make
+
+      - name: Unit tests and GPU probe
+        run: make test
+
+      # make test already fails when the probe fails; this step makes the
+      # required output explicit and checks it line by line.
+      - name: Require all eight probe checks on lavapipe
+        run: |
+          set -euo pipefail
+          ./build/vkbridge-probe --screenshot /tmp/vkbridge-ci.png | tee /tmp/vkbridge-probe.txt
+          ok_lines=$(grep -c '^\[ok\]' /tmp/vkbridge-probe.txt)
+          if [ "$ok_lines" -ne 8 ]; then
+            echo "expected 8 [ok] lines, got $ok_lines" >&2
+            exit 1
+          fi
+          if grep -q '^\[FAIL\]' /tmp/vkbridge-probe.txt; then
+            echo "probe reported a failure" >&2
+            exit 1
+          fi
+          test -s /tmp/vkbridge-ci.png
+          file /tmp/vkbridge-ci.png | grep -q 'PNG image data, 320 x 200'
+
+      - name: clang-format
+        run: make format-check
+
+      - name: ASan and UBSan unit tests
+        run: make test-asan
